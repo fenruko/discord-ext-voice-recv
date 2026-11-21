@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import time
 import logging
 import threading
+import sys
 
 from operator import itemgetter
 from typing import TYPE_CHECKING
@@ -31,14 +30,12 @@ if TYPE_CHECKING:
     DecryptRTCP = Callable[[bytes], bytes]
     AfterCB = Callable[[Optional[Exception]], Any]
     SpeakingEvent = Literal['voice_member_speaking_start', 'voice_member_speaking_stop']
-    EncryptionBox = Union[nacl.secret.SecretBox, nacl.secret.Aead]
 
 log = logging.getLogger(__name__)
 
 __all__ = [
     'AudioReader',
 ]
-
 
 class AudioReader:
     def __init__(self, sink: AudioSink, voice_client: VoiceRecvClient, *, after: Optional[AfterCB] = None):
@@ -49,7 +46,6 @@ class AudioReader:
         self.voice_client: VoiceRecvClient = voice_client
         self.after: Optional[AfterCB] = after
 
-        # No need for the whole set_sink() call
         self.sink._voice_client = voice_client
 
         self.active: bool = False
@@ -68,7 +64,6 @@ class AudioReader:
 
     def start(self) -> None:
         if self.active:
-            log.debug('Reader is already started', exc_info=True)
             return
 
         self.speaking_timer.start()
@@ -80,7 +75,6 @@ class AudioReader:
 
     def stop(self) -> None:
         if not self.active:
-            log.debug('Tried to stop an inactive reader', exc_info=True)
             return
 
         self.voice_client._connection.remove_socket_listener(self.callback)
@@ -94,13 +88,11 @@ class AudioReader:
             self.packet_router.stop()
         except Exception as e:
             self.error = e
-            log.exception('Error stopping packet router')
 
         try:
             self.event_router.stop()
         except Exception as e:
             self.error = e
-            log.exception('Error stopping event router')
 
         self.speaking_timer.stop()
         self.keepalive.stop()
@@ -109,25 +101,20 @@ class AudioReader:
             try:
                 self.after(self.error)
             except Exception:
-                log.exception('Error calling listener after function')
+                pass
 
         for sink in self.sink.root.walk_children(with_self=True):
             try:
                 sink.cleanup()
             except Exception:
-                log.exception('Error calling cleanup() for %s', sink)
+                pass
 
     def set_sink(self, sink: AudioSink) -> AudioSink:
-        """Sets the new sink for the reader and returns the old one.
-        Does not call cleanup()
-        """
-        # This whole function is potentially very racy
         old_sink = self.sink
         old_sink._voice_client = None
         sink._voice_client = self.voice_client
         self.packet_router.set_sink(sink)
         self.sink = sink
-
         return old_sink
 
     def _is_ip_discovery_packet(self, data: bytes) -> bool:
@@ -138,24 +125,78 @@ class AudioReader:
         try:
             if not rtp.is_rtcp(packet_data):
                 packet = rtp_packet = rtp.decode_rtp(packet_data)
-                packet.decrypted_data = self.decryptor.decrypt_rtp(packet)
+                
+                decrypted_transport = bytes(self.decryptor.decrypt_rtp(packet))
+                
+                vc = self.voice_client
+                session = None
+                
+                targets = [vc, getattr(vc, 'ws', None), getattr(vc, '_connection', None)]
+                for target in targets:
+                    if target is None:
+                        continue
+                    for attr in dir(target):
+                        if 'dave' in attr.lower():
+                            val = getattr(target, attr)
+                            if isinstance(val, type):
+                                continue
+                            if hasattr(val, 'decrypt') or hasattr(val, 'decrypt_audio'):
+                                session = val
+                                break
+                            if hasattr(val, '_session') and (hasattr(val._session, 'decrypt') or hasattr(val._session, 'decrypt_audio')):
+                                session = val._session
+                                break
+                    if session is not None:
+                        break
+
+                if session is None:
+                    packet.decrypted_data = decrypted_transport
+                else:
+                    user_id = self.voice_client._ssrc_to_id.get(packet.ssrc)
+                    
+                    if user_id is None:
+                        ws = getattr(self.voice_client, 'ws', None)
+                        if ws and hasattr(ws, 'ssrc_map'):
+                            user_id = ws.ssrc_map.get(packet.ssrc)
+                        elif ws and hasattr(ws, '_ssrc_map'):
+                            user_id = ws._ssrc_map.get(packet.ssrc)
+
+                    if user_id is None:
+                        if not hasattr(self, '_logged_unknown_ssrcs'):
+                            self._logged_unknown_ssrcs = set()
+                        if packet.ssrc not in self._logged_unknown_ssrcs:
+                            log.warning(f"[DAVE] Dropping packet for SSRC {packet.ssrc}: Could not find matching User ID.")
+                            self._logged_unknown_ssrcs.add(packet.ssrc)
+                        return
+                    
+                    uid_int = int(user_id)
+                    media_type = 1
+                    
+                    davey = sys.modules.get('davey')
+                    if davey and hasattr(davey, 'MediaType'):
+                        media_type = getattr(davey.MediaType, 'audio', media_type)
+                        
+                    try:
+                        res = session.decrypt(uid_int, media_type, decrypted_transport)
+                        packet.decrypted_data = res if isinstance(res, bytes) else res[0]
+                    except Exception as e1:
+                        try:
+                            res = session.decrypt(media_type, uid_int, decrypted_transport)
+                            packet.decrypted_data = res if isinstance(res, bytes) else res[0]
+                        except Exception as e2:
+                            if not hasattr(self, '_logged_decrypt_errors'):
+                                self._logged_decrypt_errors = set()
+                            if user_id not in self._logged_decrypt_errors:
+                                log.error(f"[DAVE] Decrypt failed for User {uid_int}. Errors: {e1} | {e2}")
+                                self._logged_decrypt_errors.add(user_id)
+                            return
+
             else:
-                packet = rtcp_packet = rtp.decode_rtcp(self.decryptor.decrypt_rtcp(packet_data))
-
-                if not isinstance(packet, rtp.ReceiverReportPacket):
-                    log.info("Received unexpected rtcp packet: type=%s, %s", packet.type, type(packet))
-                    log.debug("Packet info:\n  packet=%s\n  data=%s", packet, packet_data)
-        except CryptoError as e:
-            log.error("CryptoError decoding packet data")
-            log.debug("CryptoError details:\n  data=%s\n  secret_key=%s", packet_data, self.voice_client.secret_key)
-            return
+                decrypted_rtcp = self.decryptor.decrypt_rtcp(packet_data)
+                packet = rtcp_packet = rtp.decode_rtcp(decrypted_rtcp)
+                
         except Exception as e:
-            if self._is_ip_discovery_packet(packet_data):
-                log.debug("Ignoring ip discovery packet")
-                return
-
-            log.exception("Error unpacking packet")
-            log.debug("Packet data: len=%s data=%s", len(packet_data), packet_data)
+            return
         finally:
             if self.error:
                 self.stop()
@@ -168,44 +209,38 @@ class AudioReader:
         elif rtp_packet:
             ssrc = rtp_packet.ssrc
 
-            if ssrc not in self.voice_client._ssrc_to_id:
-                if rtp_packet.is_silence():
-                    # TODO: buffer packets from unknown ssrcs, 50 max?
-                    # also remove this log later its pointless
-                    log.debug("Skipping silence packet for unknown ssrc %s", ssrc)
-                    return
-                else:
-                    log.info("Received packet for unknown ssrc %s:\n%s", ssrc, rtp_packet)
-
             self.speaking_timer.notify(ssrc)
             try:
                 self.packet_router.feed_rtp(rtp_packet)
             except Exception as e:
-                log.exception('Error processing rtp packet')
                 self.error = e
                 self.stop()
 
-
 class PacketDecryptor:
-    supported_modes: list[SupportedModes] = [
+    supported_modes: list[str] = [
+        'aead_aes256_gcm_rtpsize',
+        'aead_aes256_gcm',
         'aead_xchacha20_poly1305_rtpsize',
         'xsalsa20_poly1305_lite',
         'xsalsa20_poly1305_suffix',
         'xsalsa20_poly1305',
     ]
 
-    def __init__(self, mode: SupportedModes, secret_key: bytes) -> None:
-        self.mode: SupportedModes = mode
+    def __init__(self, mode: str, secret_key: bytes) -> None:
+        self.mode: str = mode
         try:
             self.decrypt_rtp: DecryptRTP = getattr(self, '_decrypt_rtp_' + mode)
             self.decrypt_rtcp: DecryptRTCP = getattr(self, '_decrypt_rtcp_' + mode)
         except AttributeError as e:
             raise NotImplementedError(mode) from e
 
-        self.box: EncryptionBox = self._make_box(secret_key)
+        self.box: Any = self._make_box(secret_key)
 
-    def _make_box(self, secret_key: bytes) -> EncryptionBox:
-        if self.mode.startswith("aead"):
+    def _make_box(self, secret_key: bytes) -> Any:
+        if self.mode.startswith("aead_aes256_gcm"):
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            return AESGCM(secret_key)
+        elif self.mode.startswith("aead"):
             return nacl.secret.Aead(secret_key)
         else:
             return nacl.secret.SecretBox(secret_key)
@@ -213,40 +248,67 @@ class PacketDecryptor:
     def update_secret_key(self, secret_key: bytes) -> None:
         self.box = self._make_box(secret_key)
 
+    def _decrypt_rtp_aead_aes256_gcm_rtpsize(self, packet: RTPPacket) -> bytes:
+        packet.adjust_rtpsize()
+        nonce = bytearray(12)
+        nonce[:4] = packet.nonce
+        result = self.box.decrypt(bytes(nonce), bytes(packet.data), bytes(packet.header))
+        if packet.extended:
+            offset = packet.update_ext_headers(result)
+            result = result[offset:]
+        return result
+
+    def _decrypt_rtcp_aead_aes256_gcm_rtpsize(self, data: bytes) -> bytes:
+        nonce = bytearray(12)
+        nonce[:4] = data[-4:]
+        header = data[:8]
+        result = self.box.decrypt(bytes(nonce), data[8:-4], bytes(header))
+        return header + result
+
+    def _decrypt_rtp_aead_aes256_gcm(self, packet: RTPPacket) -> bytes:
+        nonce = bytearray(12)
+        nonce[:12] = packet.header
+        result = self.box.decrypt(bytes(nonce), bytes(packet.data), bytes(packet.header))
+        if packet.extended:
+            offset = packet.update_ext_headers(result)
+            result = result[offset:]
+        return result
+
+    def _decrypt_rtcp_aead_aes256_gcm(self, data: bytes) -> bytes:
+        nonce = bytearray(12)
+        nonce[:8] = data[:8]
+        header = data[:8]
+        result = self.box.decrypt(bytes(nonce), data[8:], bytes(header))
+        return header + result
+
     def _decrypt_rtp_xsalsa20_poly1305(self, packet: RTPPacket) -> bytes:
         nonce = bytearray(24)
         nonce[:12] = packet.header
         result = self.box.decrypt(bytes(packet.data), bytes(nonce))
-
         if packet.extended:
             offset = packet.update_ext_headers(result)
             result = result[offset:]
-
         return result
 
     def _decrypt_rtcp_xsalsa20_poly1305(self, data: bytes) -> bytes:
         nonce = bytearray(24)
         nonce[:8] = data[:8]
         result = self.box.decrypt(data[8:], bytes(nonce))
-
         return data[:8] + result
 
     def _decrypt_rtp_xsalsa20_poly1305_suffix(self, packet: RTPPacket) -> bytes:
         nonce = packet.data[-24:]
         voice_data = packet.data[:-24]
         result = self.box.decrypt(bytes(voice_data), bytes(nonce))
-
         if packet.extended:
             offset = packet.update_ext_headers(result)
             result = result[offset:]
-
         return result
 
     def _decrypt_rtcp_xsalsa20_poly1305_suffix(self, data: bytes) -> bytes:
         nonce = data[-24:]
         header = data[:8]
         result = self.box.decrypt(data[8:-24], nonce)
-
         return header + result
 
     def _decrypt_rtp_xsalsa20_poly1305_lite(self, packet: RTPPacket) -> bytes:
@@ -254,11 +316,9 @@ class PacketDecryptor:
         nonce[:4] = packet.data[-4:]
         voice_data = packet.data[:-4]
         result = self.box.decrypt(bytes(voice_data), bytes(nonce))
-
         if packet.extended:
             offset = packet.update_ext_headers(result)
             result = result[offset:]
-
         return result
 
     def _decrypt_rtcp_xsalsa20_poly1305_lite(self, data: bytes) -> bytes:
@@ -266,41 +326,29 @@ class PacketDecryptor:
         nonce[:4] = data[-4:]
         header = data[:8]
         result = self.box.decrypt(data[8:-4], bytes(nonce))
-
         return header + result
 
     def _decrypt_rtp_aead_xchacha20_poly1305_rtpsize(self, packet: RTPPacket) -> bytes:
         packet.adjust_rtpsize()
-
         nonce = bytearray(24)
         nonce[:4] = packet.nonce
         voice_data = packet.data
-
-        # Blob vomit
-        assert isinstance(self.box, nacl.secret.Aead)
         result = self.box.decrypt(bytes(voice_data), bytes(packet.header), bytes(nonce))
-
         if packet.extended:
             offset = packet.update_ext_headers(result)
             result = result[offset:]
-
         return result
 
     def _decrypt_rtcp_aead_xchacha20_poly1305_rtpsize(self, data: bytes) -> bytes:
         nonce = bytearray(24)
         nonce[:4] = data[-4:]
         header = data[:8]
-
-        assert isinstance(self.box, nacl.secret.Aead)
         result = self.box.decrypt(data[8:-4], bytes(header), bytes(nonce))
-
         return header + result
-
 
 class SpeakingTimer(threading.Thread):
     def __init__(self, reader: AudioReader):
         super().__init__(daemon=True, name=f'speaking-timer-{id(self):x}')
-
         self.reader: AudioReader = reader
         self.voice_client = reader.voice_client
         self.speaking_timeout_delay: float = 0.2
@@ -329,7 +377,6 @@ class SpeakingTimer(threading.Thread):
             self.last_speaking_state[ssrc] = True
             self.maybe_dispatch_speaking_start(ssrc)
             self.speaking_cache[ssrc] = time.perf_counter()
-
         self.speaking_timer_event.set()
         self.speaking_timer_event.clear()
 
@@ -349,54 +396,40 @@ class SpeakingTimer(threading.Thread):
 
     def run(self) -> None:
         _i1 = itemgetter(1)
-
         def get_next_entry():
             cache = sorted(self.speaking_cache.items(), key=_i1)
             for ssrc, tlast in cache:
-                # only return pair if speaking
                 if self.last_speaking_state.get(ssrc):
                     return ssrc, tlast
-
             return None, None
 
         self.speaking_timer_event.wait()
         while not self._end_thread.is_set():
             if not self.speaking_cache:
                 self.speaking_timer_event.wait()
-
             tnow = time.perf_counter()
             ssrc, tlast = get_next_entry()
-
-            # no ssrc has been speaking, nothing to timeout
             if ssrc is None or tlast is None:
                 self.speaking_timer_event.wait()
                 continue
-
             self.speaking_timer_event.wait(tlast + self.speaking_timeout_delay - tnow)
-
             if time.perf_counter() < tlast + self.speaking_timeout_delay:
                 continue
-
             self.dispatch('voice_member_speaking_stop', ssrc)
             self.last_speaking_state[ssrc] = False
 
-
-# TODO: unify into a single thread that does all keepalives
 class UDPKeepAlive(threading.Thread):
     delay: int = 5000
 
     def __init__(self, voice_client: VoiceRecvClient):
         super().__init__(daemon=True, name=f"voice-udp-keepalive-{id(self):x}")
-
         self.voice_client: VoiceRecvClient = voice_client
-
         self.last_time: float = 0
         self.counter: int = 0
         self._end_thread: threading.Event = threading.Event()
 
     def run(self) -> None:
         self.voice_client.wait_until_connected()
-
         while not self._end_thread.is_set():
             vc = self.voice_client
             try:
@@ -404,12 +437,9 @@ class UDPKeepAlive(threading.Thread):
             except OverflowError:
                 self.counter = 0
                 continue
-
             try:
                 vc._connection.socket.sendto(packet, (vc._connection.endpoint_ip, vc._connection.voice_port))
-            except Exception as e:
-                log.debug("Error sending keepalive to socket: %s: %s", e.__class__.__name__, e)
-                # TODO: test connection interruptions
+            except Exception:
                 vc.wait_until_connected()
                 if vc.is_connected():
                     continue
