@@ -149,7 +149,10 @@ class AudioReader:
                     if session is not None:
                         break
 
-                if session is None:
+                conn = getattr(vc, '_connection', None)
+                if session is None or getattr(conn, 'dave_protocol_version', None) == 0:
+                    # No DAVE E2EE on this connection (or in this channel): the
+                    # transport-decrypted payload is already plain Opus.
                     packet.decrypted_data = decrypted_transport
                 else:
                     user_id = self.voice_client._ssrc_to_id.get(packet.ssrc)
@@ -187,7 +190,17 @@ class AudioReader:
                             if not hasattr(self, '_logged_decrypt_errors'):
                                 self._logged_decrypt_errors = set()
                             if user_id not in self._logged_decrypt_errors:
-                                log.error(f"[DAVE] Decrypt failed for User {uid_int}. Errors: {e1} | {e2}")
+                                try:
+                                    known = list(session.get_user_ids())
+                                except Exception as ge:
+                                    known = f"unavailable ({ge})"
+                                log.error(
+                                    f"[DAVE] Decrypt failed for User {uid_int}: {e1} | {e2} "
+                                    f"[ready={getattr(session, 'ready', '?')} "
+                                    f"protocol={getattr(conn, 'dave_protocol_version', '?')} "
+                                    f"user_in_group={uid_int in known if isinstance(known, list) else '?'} "
+                                    f"group_members={known}]"
+                                )
                                 self._logged_decrypt_errors.add(user_id)
                             return
 
