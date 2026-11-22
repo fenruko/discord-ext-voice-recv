@@ -22,6 +22,20 @@ python -m pip install git+https://github.com/imayhaveborkedit/discord-ext-voice-
 
 Naturally, this extension depends on `discord.py` being installed with voice support (`pynacl`).
 
+### DAVE compatibility
+DAVE-encrypted channels require a DAVE-capable `discord.py` release (2.7 or newer). This extension currently requires `davey>=0.1.0,<0.2.0`: `discord.py` 2.7.1 does not make the explicit key-transition calls introduced in [davey 0.2](https://github.com/Snazzah/davey/releases/tag/py-0.2.0).
+
+An incompatible combination can leave the session at `ready=False` with `NoDecryptorForUser`, even when the sender appears in `group_members`. Group membership does not mean that media decryption keys have been installed. The additional `MediaType ... cannot be interpreted as an integer` error in older revisions of this extension comes from an incorrect retry with reversed arguments, not from the user's ID.
+
+To repair an existing environment, run these commands with the same Python interpreter used by your bot:
+
+```sh
+python -m pip install --upgrade "discord.py[voice]>=2.7" "davey>=0.1.0,<0.2.0"
+python -m pip check
+```
+
+Then restart the bot and reconnect to voice so it creates a new session. Reinstalling this checkout with `python -m pip install --upgrade -e .` also applies the dependency constraint. Packets arriving before the DAVE session is ready are dropped rather than sent to the Opus decoder; reception resumes automatically when keys are available.
+
 ## Example
 See the [example script](examples/recv.py).
 
@@ -220,6 +234,14 @@ A helper sink for using `SpeechRecognition` to perform speech-to-text conversion
 - Provides: `LocalPlaybackSink`, `SimpleLocalPlaybackSink`
 
 Helper sinks for playing audio through an audio output device the local system.  Defaults to the system default device, but other output devices can also be specified.
+
+## Development
+Install the checkout and run the regression tests without a Discord connection:
+
+```sh
+python -m pip install -e .
+python -m unittest discover -s tests -v
+```
 
 ## Currently missing or WIP features
 - Silence generation (WIP, pending rewrite)
