@@ -49,7 +49,11 @@ setup(
     long_description_content_type='text/markdown',
     include_package_data=True,
     python_requires='>=3.8',
-    install_requires=['discord.py[voice]>=2.5'],
+    install_requires=[
+        'discord.py[voice]>=2.5',
+        # discord.py 2.7.1 does not implement davey 0.2's explicit key transitions.
+        'davey>=0.1.0,<0.2.0',
+    ],
     extras_require=extras_require,
     zip_safe=False,
     classifiers=[

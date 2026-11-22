@@ -3,10 +3,11 @@ from __future__ import annotations
 import time
 import logging
 import threading
-import sys
 
 from operator import itemgetter
 from typing import TYPE_CHECKING
+
+import davey
 
 from . import rtp
 from .sinks import AudioSink
@@ -55,6 +56,9 @@ class AudioReader:
         self.decryptor: PacketDecryptor = PacketDecryptor(voice_client.mode, bytes(voice_client.secret_key))
         self.speaking_timer: SpeakingTimer = SpeakingTimer(self)
         self.keepalive: UDPKeepAlive = UDPKeepAlive(voice_client)
+        self._waiting_for_dave: bool = False
+        self._logged_unknown_ssrcs: set[int] = set()
+        self._logged_decrypt_errors: set[int] = set()
 
     def is_listening(self) -> bool:
         return self.active
@@ -120,90 +124,76 @@ class AudioReader:
     def _is_ip_discovery_packet(self, data: bytes) -> bool:
         return len(data) == 74 and data[1] == 0x02
 
+    def _decrypt_dave(self, packet: RTPPacket, data: bytes) -> Optional[bytes]:
+        connection = self.voice_client._connection
+        protocol_version = getattr(connection, 'dave_protocol_version', 0)
+        if protocol_version == 0:
+            # Older discord.py versions and non-DAVE channels use plain Opus
+            # after transport decryption.
+            self._waiting_for_dave = False
+            return data
+
+        session = getattr(connection, 'dave_session', None)
+        if session is None or not session.ready:
+            # Group membership alone does not mean the media keys are installed.
+            # Never pass encrypted data to the Opus decoder while waiting for them.
+            if not self._waiting_for_dave:
+                log.warning(
+                    "[DAVE] Dropping audio while waiting for session keys [protocol=%s davey=%s]. "
+                    "If this persists, check discord.py/davey version compatibility.",
+                    protocol_version,
+                    davey.__version__,
+                )
+                self._waiting_for_dave = True
+            return None
+        self._waiting_for_dave = False
+
+        user_id = self.voice_client._ssrc_to_id.get(packet.ssrc)
+        if user_id is None:
+            if packet.ssrc not in self._logged_unknown_ssrcs:
+                log.warning("[DAVE] Dropping packet for SSRC %s: Could not find matching User ID.", packet.ssrc)
+                self._logged_unknown_ssrcs.add(packet.ssrc)
+            return None
+        self._logged_unknown_ssrcs.discard(packet.ssrc)
+        user_id = int(user_id)
+
+        try:
+            # A decryption failure is not evidence of a different API signature:
+            # davey expects the user ID first, then the media type and payload.
+            result = session.decrypt(user_id, davey.MediaType.audio, data)
+        except Exception as exc:
+            if user_id not in self._logged_decrypt_errors:
+                known: Union[list[int], str]
+                try:
+                    # davey 0.1.x returns string IDs from get_user_ids().
+                    known = [int(uid) for uid in session.get_user_ids()]
+                except Exception as group_error:
+                    known = f"unavailable ({group_error})"
+                log.error(
+                    "[DAVE] Decrypt failed for User %s: %s "
+                    "[ready=%s protocol=%s user_in_group=%s group_members=%s]",
+                    user_id,
+                    exc,
+                    session.ready,
+                    protocol_version,
+                    user_id in known if isinstance(known, list) else '?',
+                    known,
+                )
+                self._logged_decrypt_errors.add(user_id)
+            return None
+
+        self._logged_decrypt_errors.discard(user_id)
+        return result
+
     def callback(self, packet_data: bytes) -> None:
         packet = rtp_packet = rtcp_packet = None
         try:
             if not rtp.is_rtcp(packet_data):
                 packet = rtp_packet = rtp.decode_rtp(packet_data)
-                
                 decrypted_transport = bytes(self.decryptor.decrypt_rtp(packet))
-                
-                vc = self.voice_client
-                session = None
-                
-                targets = [vc, getattr(vc, 'ws', None), getattr(vc, '_connection', None)]
-                for target in targets:
-                    if target is None:
-                        continue
-                    for attr in dir(target):
-                        if 'dave' in attr.lower():
-                            val = getattr(target, attr)
-                            if isinstance(val, type):
-                                continue
-                            if hasattr(val, 'decrypt') or hasattr(val, 'decrypt_audio'):
-                                session = val
-                                break
-                            if hasattr(val, '_session') and (hasattr(val._session, 'decrypt') or hasattr(val._session, 'decrypt_audio')):
-                                session = val._session
-                                break
-                    if session is not None:
-                        break
-
-                conn = getattr(vc, '_connection', None)
-                if session is None or getattr(conn, 'dave_protocol_version', None) == 0:
-                    # No DAVE E2EE on this connection (or in this channel): the
-                    # transport-decrypted payload is already plain Opus.
-                    packet.decrypted_data = decrypted_transport
-                else:
-                    user_id = self.voice_client._ssrc_to_id.get(packet.ssrc)
-                    
-                    if user_id is None:
-                        ws = getattr(self.voice_client, 'ws', None)
-                        if ws and hasattr(ws, 'ssrc_map'):
-                            user_id = ws.ssrc_map.get(packet.ssrc)
-                        elif ws and hasattr(ws, '_ssrc_map'):
-                            user_id = ws._ssrc_map.get(packet.ssrc)
-
-                    if user_id is None:
-                        if not hasattr(self, '_logged_unknown_ssrcs'):
-                            self._logged_unknown_ssrcs = set()
-                        if packet.ssrc not in self._logged_unknown_ssrcs:
-                            log.warning(f"[DAVE] Dropping packet for SSRC {packet.ssrc}: Could not find matching User ID.")
-                            self._logged_unknown_ssrcs.add(packet.ssrc)
-                        return
-                    
-                    uid_int = int(user_id)
-                    media_type = 1
-                    
-                    davey = sys.modules.get('davey')
-                    if davey and hasattr(davey, 'MediaType'):
-                        media_type = getattr(davey.MediaType, 'audio', media_type)
-                        
-                    try:
-                        res = session.decrypt(uid_int, media_type, decrypted_transport)
-                        packet.decrypted_data = res if isinstance(res, bytes) else res[0]
-                    except Exception as e1:
-                        try:
-                            res = session.decrypt(media_type, uid_int, decrypted_transport)
-                            packet.decrypted_data = res if isinstance(res, bytes) else res[0]
-                        except Exception as e2:
-                            if not hasattr(self, '_logged_decrypt_errors'):
-                                self._logged_decrypt_errors = set()
-                            if user_id not in self._logged_decrypt_errors:
-                                try:
-                                    known = list(session.get_user_ids())
-                                except Exception as ge:
-                                    known = f"unavailable ({ge})"
-                                log.error(
-                                    f"[DAVE] Decrypt failed for User {uid_int}: {e1} | {e2} "
-                                    f"[ready={getattr(session, 'ready', '?')} "
-                                    f"protocol={getattr(conn, 'dave_protocol_version', '?')} "
-                                    f"user_in_group={uid_int in known if isinstance(known, list) else '?'} "
-                                    f"group_members={known}]"
-                                )
-                                self._logged_decrypt_errors.add(user_id)
-                            return
-
+                packet.decrypted_data = self._decrypt_dave(packet, decrypted_transport)
+                if packet.decrypted_data is None:
+                    return
             else:
                 decrypted_rtcp = self.decryptor.decrypt_rtcp(packet_data)
                 packet = rtcp_packet = rtp.decode_rtcp(decrypted_rtcp)
